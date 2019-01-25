@@ -12,7 +12,7 @@
 %% API
 -export([start_link/0]).
 -export([register_new/1, register/1, update/2, unregister/1,
-	 register/3, unregister/2,
+	 register/2, register/3, unregister/2,
 	 lookup_key/2, lookup_keys/2,
 	 lookup_teid/2, lookup_seid/1,
 	 match_key/2, match_keys/2,
@@ -87,6 +87,9 @@ register(#context{} = Context) ->
 
 register_new(#context{} = Context) ->
     gen_server:call(?SERVER, {register_new, Context}).
+
+register(Key, Context) when is_pid(Context) ->
+    gen_server:call(?SERVER, {register, Key, Context}).
 
 register(#gtp_port{name = Name}, Key, Context) when is_pid(Context) ->
     gen_server:call(?SERVER, {register, {Name, Key}, Context}).

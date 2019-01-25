@@ -12,7 +12,7 @@
 -compile({parse_transform, cut}).
 
 %% API
--export([select_sx_node/2, select_sx_node/3]).
+-export([select_sx_node/2, select_sx_node/3, connect_sx_node/3]).
 -export([start_link/3, send/4, call/2, call/3,
 	 get_vrfs/1, handle_request/3, response/3]).
 -ifdef(TEST).
@@ -32,6 +32,7 @@
 	       recovery_ts       :: undefined | non_neg_integer(),
 	       gtp_port,
 	       cp_tei            :: undefined | non_neg_integer(),
+	       cp_seid           :: undefined | non_neg_integer(),
 	       cp,
 	       dp,
 	       vrfs}).
@@ -104,9 +105,28 @@ handle_request(ReqKey, _IP, #pfcp{type = session_report_request} = Report) ->
     spawn(fun() -> handle_request_fun(ReqKey, Report) end),
     ok.
 
-handle_request_fun(ReqKey, #pfcp{type = session_report_request, seq_no = SeqNo} = Report) ->
+handle_request_fun(ReqKey, #pfcp{type = session_report_request,
+				 seid = SEID,
+				 seq_no = SeqNo} = Report) ->
+    Result =
+	case gtp_context_reg:lookup_seid(SEID) of
+	    Context when is_pid(Context) ->
+		%% FIXME: deadly hack ahead
+		%%   we can not know if the process that registered the
+		%%   SEID is really a gen_server or if it supports the
+		%%   Sx report feature. Fortunatly the gen_statem accepts
+		%%   the call as well....
+		%%
+		%%   Doing it this way saves us a major rewrite (or swapout)
+		%%   of the gtp_context_reg (for now).
+		%%
+		gen_server:call(Context, {sx, ReqKey, Report});
+	    _ ->
+		lager:error("Session Report: didn't find ~p", [SEID]),
+		{error, not_found}
+	end,
     {SEID, IEs} =
-	case gtp_context:session_report(ReqKey, Report) of
+	case Result of
 	    {ok, SEID0} ->
 		{SEID0, #{pfcp_cause => #pfcp_cause{cause = 'Request accepted'}}};
 	    {ok, SEID0, Cause}
@@ -165,10 +185,14 @@ init([Node, IP4, IP6]) ->
 
     {ok, CP, GtpPort} = ergw_sx_socket:id(),
     {ok, TEI} = gtp_context_reg:alloc_tei(GtpPort),
+    SEID = ergw_sx_socket:seid(),
+
     gtp_context_reg:register(GtpPort, {teid, 'gtp-u', TEI}, self()),
+    gtp_context_reg:register({seid, SEID}, self()),
 
     Data = #data{gtp_port = GtpPort,
 		 cp_tei = TEI,
+		 cp_seid = SEID,
 		 cp = CP,
 		 dp = #node{node = Node, ip = IP},
 		 vrfs = init_vrfs(Node)
@@ -333,7 +357,10 @@ handle_event(cast, {handle_pdu, _Request, #gtp{type=g_pdu, ie = PDU}}, _, Data) 
 	    ST = erlang:get_stacktrace(),
 	    lager:error("handler for GTP-U failed with: ~p:~p @ ~p", [Class, Error, ST])
     end,
-    keep_state_and_data.
+    keep_state_and_data;
+handle_event({call, From}, {sx, _ReqKey, Report}, _State, #data{cp_seid = SEID}) ->
+    lager:info("Sx NodeSession Report: ~p", [Report]),
+    {keep_state_and_data, [{reply, From, {ok, SEID}}]}.
 
 terminate(_Reason, _Data) ->
     ok.
@@ -593,10 +620,20 @@ gen_per_feature_cp_rule('Access', DpGtpIP, #data{gtp_port = GtpPort}, {VRF0, Rul
 
     VRF = VRF0#vrf{cp_to_access_tei = TEI},
     {VRF, [PDR, FAR | Rules]};
+gen_per_feature_cp_rule('TDF-Source', _DpGtpIP,
+			#data{gtp_port = GtpPort, cp_tei = TEI},
+			{VRF, Rules}) ->
+    RuleId = length(Rules) + 1,
+    PDR = create_tdf_to_cp_pdr(RuleId, VRF),
+    FAR = create_tdf_drop_far(RuleId, TEI, GtpPort),
+    URR = create_tdf_report_urr(RuleId),
+
+    {VRF, [PDR, FAR, URR | Rules]};
 gen_per_feature_cp_rule(_, _DpGtpIP, _Data, Acc) ->
     Acc.
 
-install_cp_rules(#data{cp = #node{node = _Node, ip = CpNodeIP},
+install_cp_rules(#data{cp_seid = SEID,
+		       cp = #node{node = _Node, ip = CpNodeIP},
 		       dp = #node{ip = DpNodeIP},
 		       vrfs = VRFs0} = Data) ->
     [#vrf{ipv4 = DpGtpIP4, ipv6 = DpGtpIP6}] =
@@ -607,9 +644,7 @@ install_cp_rules(#data{cp = #node{node = _Node, ip = CpNodeIP},
 
     {VRFs, Rules} = maps_mapfold(gen_cp_rules(_, _, DpGtpIP, Data, _), [], VRFs0),
 
-    SEID = ergw_sx_socket:seid(),
     IEs = [ergw_pfcp:f_seid(SEID, CpNodeIP) | Rules],
-
     Req0 = #pfcp{version = v1, type = session_establishment_request, seid = 0, ie = IEs},
     Req = augment_mandatory_ie(Req0, Data),
     ergw_sx_socket:call(DpNodeIP, Req, response_cb(from_cp_rule)),
@@ -644,5 +679,58 @@ create_from_cp_far(Intf, VRF, RuleId, _Port) ->
 		    ergw_pfcp:network_instance(VRF)
 		   ]
 	      }
+	   ]
+      }.
+
+create_tdf_to_cp_pdr(RuleId, VRF) ->
+    #create_pdr{
+       group =
+	   [#pdr_id{id = RuleId},
+	    #precedence{precedence = 65000},
+
+	    #pdi{
+	       group =
+		   [#source_interface{interface = 'Access'},
+		    ergw_pfcp:network_instance(VRF),
+		    %% WildCard SDF
+		    #sdf_filter{
+		       flow_description =
+			   <<"permit out ip from any to any">>}
+		   ]
+	      },
+	    #far_id{id = RuleId},
+	    #urr_id{id = RuleId}]
+      }.
+
+%% create_tdf_to_cp_far(RuleId, TEI, #gtp_port{ip = CpIP} = Port) ->
+%%     #create_far{
+%%        group =
+%% 	   [#far_id{id = RuleId},
+%% 	    #apply_action{forw = 1},
+%% 	    #forwarding_parameters{
+%% 	       group =
+%% 		   [#destination_interface{interface = 'CP-function'},
+%% 		    ergw_pfcp:network_instance(Port),
+%% 		    ergw_pfcp:outer_header_creation(#fq_teid{ip = CpIP, teid = TEI})
+%% 		   ]
+%% 	      }
+%% 	   ]
+%%       }.
+
+create_tdf_drop_far(RuleId, TEI, #gtp_port{ip = CpIP} = Port) ->
+    #create_far{
+       group =
+	   [#far_id{id = RuleId},
+	    #apply_action{drop= 1}
+	   ]
+      }.
+
+create_tdf_report_urr(RuleId) ->
+    #create_urr{
+       group =
+	   [#urr_id{id = RuleId},
+	    #measurement_method{event = 1},
+	    #reporting_triggers{start_of_traffic = 1},
+	    #time_quota{quota = 60}
 	   ]
       }.

@@ -1,0 +1,317 @@
+%-*-Erlang-*-
+[{setup, [{data_dir, "/var/lib/ergw"},
+	  {log_dir,  "/var/log/gtp-c-node"}				%% NOTE: lager is not using this
+	 ]},
+
+ {ergw, [{'$setup_vars',
+	  [{"ORIGIN", {value, "epc.mnc001.mcc001.3gppnetwork.org"}}]},
+	 {http_api,
+	  [{port, 8080},
+	   {ip, {0,0,0,0}}
+	  ]},
+	 {sockets,
+	  [{'cp-socket',
+	    [{type, 'gtp-u'},
+	     {vrf, cp},
+	     {ip,  {172,21,16,2}},
+	     freebind,
+	     {reuseaddr, true}
+	    ]},
+	   {irx, [{type, 'gtp-c'},
+		  {vrf, epc},
+		  {ip,  {172,20,16,28}},
+		  {reuseaddr, true}
+		 ]}
+	  ]},
+
+	 {vrfs,
+	  [{sgi, [{pools,  [{{10, 106, 0, 1}, {10, 106, 255, 254}, 32},
+			    {{16#8001, 0, 0, 0, 0, 0, 0, 0},
+			     {16#8001, 0, 0, 16#FFFF, 0, 0, 0, 0}, 64}
+			   ]},
+		  {'MS-Primary-DNS-Server', {8,8,8,8}},
+		  {'MS-Secondary-DNS-Server', {8,8,4,4}},
+		  {'MS-Primary-NBNS-Server', {127,0,0,1}},
+		  {'MS-Secondary-NBNS-Server', {127,0,0,1}}
+		 ]}
+	  ]},
+
+	 {sx_socket,
+	  [{node, 'ergw'},
+	   {name, 'ergw'},
+	   {socket, 'cp-socket'},
+	   {ip,  {172,21,16,2}},
+	   freebind
+	  ]},
+
+	 {handlers,
+	  [{'h1', [{handler, tdf},
+		   {protocol, ip},
+		   {nodes, ["topon.sx.prox01.$ORIGIN"]},
+		   {node_selection, [default]}
+		  ]}
+	  ]},
+
+	 {apns,
+	  [{[<<"tpip">>, <<"net">>], [{vrf, sgi}]},
+	   {[<<"APN1">>], [{vrf, sgi}]},
+	   {'_', [{vrf, sgi}]}
+	  ]},
+
+	 {node_selection,
+	  [{default,
+	    {static,
+	     [
+	      %% APN NAPTR alternative
+	      {"_default.apn.$ORIGIN", {300,64536},
+	       [{"x-3gpp-pgw","x-s5-gtp"},{"x-3gpp-pgw","x-s8-gtp"},
+		{"x-3gpp-pgw","x-gn"},{"x-3gpp-pgw","x-gp"}],
+	       "topon.s5s8.pgw.$ORIGIN"},
+	      {"_default.apn.$ORIGIN", {300,64536},
+	       [{"x-3gpp-upf","x-sxb"}],
+	       "topon.sx.prox01.$ORIGIN"},
+
+	      {"web.apn.$ORIGIN", {300,64536},
+	       [{"x-3gpp-pgw","x-s5-gtp"},{"x-3gpp-pgw","x-s8-gtp"},
+		{"x-3gpp-pgw","x-gn"},{"x-3gpp-pgw","x-gp"}],
+	       "topon.s5s8.pgw.$ORIGIN"},
+	      {"web.apn.$ORIGIN", {300,64536},
+	       [{"x-3gpp-upf","x-sxb"}],
+	       "topon.sx.prox01.$ORIGIN"},
+
+	      %% A/AAAA record alternatives
+	      {"topon.s5s8.pgw.$ORIGIN",  [{172, 20, 16, 28}], []},
+	      {"topon.sx.prox01.$ORIGIN", [{172,21,16,1}], []}
+	     ]
+	    }
+	   },
+	   {dns, {dns, {{8,8,8,8}, 53}}}
+	  ]
+	 },
+
+	 {nodes,
+	  [{default,
+	    [{vrfs,
+	      [{cp, [{features, ['CP-Function']}]},
+	       {epc, [{features, ['TDF-Source', 'Access']}]},
+	       {sgi, [{features, ['SGi-LAN']}]}]
+	     }]
+	   }]
+	 }
+	]},
+
+%% {exometer_core, [{reporters, [{exometer_report_netdata, []}]}]},
+
+ {ergw_aaa,
+  [{functions,
+    [{'pgw-epc', [{handler, ergw_aaa_diameter},
+		  {'Origin-Host', <<"ergw-pgw.dia.tpip.net">>},
+		  {'Origin-Realm', <<"dia.tpip.net">>},
+		  {transports,
+		   [
+		    [{connect_to, <<"aaa://srv1.dia.tpip.net;transport=sctp">>}]
+		   ]}
+		  %% more function options
+		 ]}
+    ]},
+
+   {handlers,
+    [{ergw_aaa_static,
+	[{'NAS-Identifier',          <<"NAS-Identifier">>},
+	 {'Acct-Interim-Interval',   300},
+	 {'Framed-Protocol',         'PPP'},
+	 {'Service-Type',            'Framed-User'},
+	 {'Node-Id',                 <<"PGW-001">>},
+	 {'Charging-Rule-Base-Name', <<"m2m0001">>},
+	 {'Offline-Charging-Profile',
+	  #{'Default' =>
+		#{'Tariff-Time' => [{15, 4}]}
+	   }
+	 },
+	 {rules, #{'Default' =>
+		       #{'Rating-Group' => [3000],
+			  'Flow-Information' =>
+			      [#{'Flow-Description' => [<<"permit out ip from any to assigned">>],
+				 'Flow-Direction'   => [1]    %% DownLink
+				},
+			       #{'Flow-Description' => [<<"permit out ip from any to assigned">>],
+				 'Flow-Direction'   => [2]    %% UpLink
+				}],
+			  'Metering-Method'  => [2],
+			  'Precedence' => [100],
+			  'Online'  => [1],
+			  'Offline'  => [1]
+			 },
+		   'Gold' =>
+		       #{'Rating-Group' => [2000],
+			 'TDF-Application-Identifier' => [<<"Gold">>],
+			 'Metering-Method'  => [2],
+			 'Precedence' => [50],
+			 'Online'  => [1],
+			 'Offline'  => [1]
+			},
+		   'Silver' =>
+		       #{'Rating-Group' => [1000],
+			 'TDF-Application-Identifier' => [<<"Silver">>],
+			 'Metering-Method'  => [2],
+			 'Precedence' => [10],
+			 'Online'  => [1],
+			 'Offline'  => [1]
+			}
+		  }
+	 }
+	]},
+     {ergw_aaa_rf, [{function, 'pgw-epc'},
+		    {'Destination-Realm', <<"test-srv.example.com">>}]},
+     {ergw_aaa_ro, [{function, 'pgw-epc'},
+		    {'Destination-Realm', <<"test-srv.example.com">>}]}
+    ]},
+
+   {services,
+    [{'Default', [{handler, 'ergw_aaa_static'},
+		  {answers, #{'Initial-OCS' =>
+				  #{'Result-Code' => [2001],
+				    'Multiple-Services-Credit-Control' =>
+					[#{'Envelope-Reporting' => [0],
+					   'Granted-Service-Unit' =>
+					       [#{'CC-Time' => [3600],
+						  'CC-Total-Octets' => [102400]}],
+					   'Rating-Group' => [1000],
+					   'Result-Code' => [2001],
+					   'Time-Quota-Threshold' => [60],
+					   'Volume-Quota-Threshold' => [10240]},
+					 #{'Envelope-Reporting' => [0],
+					   'Granted-Service-Unit' =>
+					       [#{'CC-Time' => [3600],
+						  'CC-Total-Octets' => [102400]}],
+					   'Rating-Group' => [2000],
+					   'Result-Code' => [2001],
+					   'Time-Quota-Threshold' => [60],
+					   'Volume-Quota-Threshold' => [10240]},
+					 #{'Envelope-Reporting' => [0],
+					   'Granted-Service-Unit' =>
+					       [#{'CC-Time' => [3600],
+						  'CC-Total-Octets' => [102400]}],
+					   'Rating-Group' => [3000],
+					   'Result-Code' => [2001],
+					   'Time-Quota-Threshold' => [60],
+					   'Volume-Quota-Threshold' => [10240]}
+					]
+				   }
+			     }
+		  }
+		 ]},
+     {'Rf',      [{handler, 'ergw_aaa_rf'}]},
+     {'Ro',      [{handler, 'ergw_aaa_ro'},
+		  {answers, #{'Initial-If-Down' =>
+				  #{'Result-Code' => 2001,
+				    'Multiple-Services-Credit-Control' =>
+					[#{'Envelope-Reporting' => [0],
+					   'Granted-Service-Unit' =>
+					       [#{'CC-Time' => [3600]}],
+					   'Rating-Group' => [1000],
+					   'Result-Code' => [2001],
+					   'Time-Quota-Threshold' => [60]},
+					 #{'Envelope-Reporting' => [0],
+					   'Granted-Service-Unit' =>
+					       [#{'CC-Time' => [3600]}],
+					   'Rating-Group' => [2000],
+					   'Result-Code' => [2001],
+					   'Time-Quota-Threshold' => [60]},
+					 #{'Envelope-Reporting' => [0],
+					   'Granted-Service-Unit' =>
+					       [#{'CC-Time' => [3600]}],
+					   'Rating-Group' => [3000],
+					   'Result-Code' => [2001],
+					   'Time-Quota-Threshold' => [60]}
+					]
+				   },
+			      'Update-If-Down' =>
+				  #{'Result-Code' => 5003}
+			     }
+		  }
+		 ]}
+    ]},
+
+   {apps,
+    [{default,
+      [{session, ['Default']},
+       {procedures, [{authenticate, []},
+		     {authorize, []},
+		     {start, []},
+		     {interim, []},
+		     {stop, []},
+
+		     {{rf, 'Initial'},   ['Rf']},
+		     {{rf, 'Update'},    ['Rf']},
+		     {{rf, 'Terminate'}, ['Rf']},
+		     %% {start, ['Rf']},
+		     %% {interim, ['Rf']},
+		     %% {stop, ['Rf']},
+
+		     {{gx, 'CCR-Initial'},   []},
+		     {{gx, 'CCR-Update'},    []},
+		     {{gx, 'CCR-Terminate'}, []},
+
+		     %% {{gy, 'CCR-Initial'},   [{'Default', [{answer, 'Initial-If-Down'}]}]},
+		     %% %% {{gy, 'CCR-Initial'},   [{'Default', [{answer, 'Initial-OCS'}]}]},
+		     %% {{gy, 'CCR-Update'},    [{'Default', [{answer, 'Update-If-Down'}]}]},
+		     %% {{gy, 'CCR-Terminate'}, []}]}
+
+		     %% {{gy, 'CCR-Initial'},   [{'Ro', [{answer_if_down, 'Initial-If-Down'}]}]},
+		     %% {{gy, 'CCR-Update'},    [{'Ro', [{answer_if_down, 'Update-If-Down'}]}]},
+		     %% {{gy, 'CCR-Terminate'}, ['Ro']}]}
+
+		     %% {{gy, 'CCR-Initial'},   ['Ro']},
+		     %% {{gy, 'CCR-Update'},    ['Ro']},
+		     %% {{gy, 'CCR-Terminate'}, ['Ro']}
+		     {{gy, 'CCR-Initial'},   []},
+		     {{gy, 'CCR-Update'},    []},
+		     {{gy, 'CCR-Terminate'}, []}
+		    ]}
+      ]}
+    ]}
+ ]},
+
+ {hackney, [
+	    {mod_metrics, exometer}
+	    ]},
+
+ {jobs, [{samplers,
+	  [{cpu_feedback, jobs_sampler_cpu, []}
+	  ]},
+	 {queues,
+	  [{path_restart,
+	    [{regulators, [{counter, [{limit, 100}]}]},
+	     {modifiers,  [{cpu_feedback, 10}]} %% 10 = % increment by which to modify the limit
+	    ]},
+	   {create,
+	    [{max_time, 5000}, %% max 5 seconds
+	     {regulators, [{rate, [{limit, 100}]}]},
+	     {modifiers,  [{cpu_feedback, 10}]} %% 10 = % increment by which to modify the limit
+	    ]},
+	   {delete,
+	    [{regulators, [{counter, [{limit, 100}]}]},
+	     {modifiers,  [{cpu_feedback, 10}]} %% 10 = % increment by which to modify the limit
+	    ]},
+	   {other,
+	    [{max_time, 10000}, %% max 10 seconds
+	     {regulators, [{rate, [{limit, 1000}]}]},
+	     {modifiers,  [{cpu_feedback, 10}]} %% 10 = % increment by which to modify the limit
+	    ]}
+	  ]}
+	]},
+
+ {lager, [
+	  {log_root, "/var/log/gtp-c-node"},
+	  {colored, true},
+	  {error_logger_redirect, true},
+	  {crash_log, "crash.log"},
+	  {error_logger_hwm, 5000},
+	  {handlers, [
+		      {lager_console_backend, [{level, debug}]},
+		      {lager_file_backend, [{file, "error.log"}, {level, error}]},
+		      {lager_file_backend, [{file, "console.log"}, {level, debug}]}
+		     ]}
+	 ]}
+].
